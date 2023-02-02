@@ -6,12 +6,13 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2023 STMicroelectronics.
-  * All rights reserved.
+  * <h2><center>&copy; Copyright (c) 2019 STMicroelectronics.
+  * All rights reserved.</center></h2>
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * This software component is licensed by ST under BSD 3-Clause license,
+  * the "License"; You may not use this file except in compliance with the
+  * License. You may obtain a copy of the License at:
+  *                        opensource.org/licenses/BSD-3-Clause
   *
   ******************************************************************************
   */
@@ -21,7 +22,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
 #include "delay.h"
 #include "spi.h"
 #include "modbus.h"
@@ -30,12 +30,10 @@
 #include <stdarg.h>
 #include <string.h>
 #include "socket.h"	// Just include one header for WIZCHIP
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 typedef enum
 { Bit_RESET = 0,
   Bit_SET
@@ -45,9 +43,7 @@ typedef enum
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
 #define LDR_VALUE  ADC_CHANNEL_1
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,11 +54,12 @@ typedef enum
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
-UART_HandleTypeDef hlpuart1;
+SPI_HandleTypeDef hspi1;
 
-SPI_HandleTypeDef hspi3;
+UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+
 
 char writeValue[60];
 uint8_t cnt;
@@ -110,12 +107,10 @@ uint8_t http_state[_WIZCHIP_SOCK_NUM_];
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_LPUART1_UART_Init(void);
-static void MX_SPI3_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_SPI1_Init(void);
 static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-
-#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 
 // initialize the dependent host peripheral
 void platform_init(void);
@@ -160,10 +155,8 @@ uint32_t Ain_Read_value(uint32_t channel);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-
 	uint8_t i;
 	uint8_t memsize[2][8] = {{2,2,2,2,2,2,2,2},{2,2,2,2,2,2,2,2}};
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -184,18 +177,50 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_LPUART1_UART_Init();
-  MX_SPI3_Init();
+  MX_USART2_UART_Init();
+  MX_SPI1_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-
-  printf(" Starting >> NUCLEO-G474RE_W5500 \n");
-
 #if (ENABLE_MB_RTU == 1)&&(ENABLE_MB_TCP == 0)
   __HAL_UART_ENABLE_IT(&huart2,UART_IT_RXNE);
 #endif
 
-  printf(" Ending   >> NUCLEO-G474RE_W5500 \n");
+   ////////////////////////////////////////////////////////////////////////////////////////////////////
+   // First of all, Should register SPI callback functions implemented by user for accessing WIZCHIP //
+   ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+   /* Chip selection call back */
+
+#if   _WIZCHIP_IO_MODE_ == _WIZCHIP_IO_MODE_SPI_VDM_
+	reg_wizchip_cs_cbfunc(wizchip_select, wizchip_deselect);
+#elif _WIZCHIP_IO_MODE_ == _WIZCHIP_IO_MODE_SPI_FDM_
+	reg_wizchip_cs_cbfunc(wizchip_select, wizchip_select);  // CS must be tried with LOW.
+#else
+   #if (_WIZCHIP_IO_MODE_ & _WIZCHIP_IO_MODE_SIP_) != _WIZCHIP_IO_MODE_SIP_
+	  #error "Unknown _WIZCHIP_IO_MODE_"
+   #else
+	  reg_wizchip_cs_cbfunc(wizchip_select, wizchip_deselect);
+   #endif
+#endif
+
+	 /* SPI Read & Write callback function */
+	reg_wizchip_spi_cbfunc(wizchip_read, wizchip_write);
+
+	////////////////////////////////////////////////////////////////////////
+	/* WIZCHIP SOCKET Buffer initialize */
+	if(ctlwizchip(CW_INIT_WIZCHIP,(void*)memsize) == -1)
+	{
+	   //init fail
+	   while(1);
+	}
+
+	/* Network initialization */
+	network_init();
+
+	//all connections inactive
+	for(i=0;i<_WIZCHIP_SOCK_NUM_;i++)
+	HTTP_reset(i);
+
 
   /* USER CODE END 2 */
 
@@ -203,11 +228,55 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_GPIO_TogglePin(GPIOA, DOUT_LED1_Pin);
-	  HAL_Delay(50);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+  	/* Loopback Test */
+  	// TCP server
+	//4 sockets para webserver http
+	for(i=4;i<_WIZCHIP_SOCK_NUM_;i++)
+	{
+		tcp_http_mt(i, gDATABUF, 80);
+	}
+	//4 sockets para modbus TCP
+	for(i=0;i<4;i++)
+	{
+		tcp_http_mt(i, gDATABUF, 502);
+	}
+	//Delayms(10);
+
+	#if (ENABLE_MB_RTU == 1)&&(ENABLE_MB_TCP == 0)
+  		//Se estava recebendo frames no canal USART e parou de receber por mais de 3ms
+  		//trata como se tivesse finalizado a recepção do frame MODBUS
+  		if((flag_busy_RTU == 1)&&(DELAY_Time_2() >= 10))
+  		{
+  			flag_busy_RTU = 0;
+  			holding_registers[1] = Ain_Read_value(LDR_VALUE);
+			MODBUS_receive_task(RX_buffer, TX_buffer, holding_registers, sizeof(TX_buffer), sizeof(RX_buffer), &FrameNrBytes);
+			HAL_UART_Transmit(&huart2, TX_buffer, FrameNrBytes, 100);
+			__HAL_UART_ENABLE_IT(&huart2,UART_IT_RXNE);
+			memset(RX_buffer,0,sizeof(RX_buffer));
+			memset(TX_buffer,0,sizeof(TX_buffer));
+			cntBufferRTU = 0;
+
+			if(holding_registers[0]&0b0000000000000001){HAL_GPIO_WritePin(DOUT_LED1_GPIO_Port, DOUT_LED1_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED1_GPIO_Port, DOUT_LED1_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000000000010){HAL_GPIO_WritePin(DOUT_LED2_GPIO_Port, DOUT_LED2_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED2_GPIO_Port, DOUT_LED2_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000000000100){HAL_GPIO_WritePin(DOUT_LED3_GPIO_Port, DOUT_LED3_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED3_GPIO_Port, DOUT_LED3_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000000001000){HAL_GPIO_WritePin(DOUT_LED4_GPIO_Port, DOUT_LED4_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED4_GPIO_Port, DOUT_LED4_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000000010000){HAL_GPIO_WritePin(DOUT_LED5_GPIO_Port, DOUT_LED5_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED5_GPIO_Port, DOUT_LED5_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000000100000){HAL_GPIO_WritePin(DOUT_LED6_GPIO_Port, DOUT_LED6_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED6_GPIO_Port, DOUT_LED6_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000001000000){HAL_GPIO_WritePin(DOUT_LED7_GPIO_Port, DOUT_LED7_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED7_GPIO_Port, DOUT_LED7_Pin, GPIO_PIN_RESET);}
+			if(holding_registers[0]&0b0000000010000000){HAL_GPIO_WritePin(DOUT_LED8_GPIO_Port, DOUT_LED8_Pin, GPIO_PIN_SET);}
+			else{HAL_GPIO_WritePin(DOUT_LED8_GPIO_Port, DOUT_LED8_Pin, GPIO_PIN_RESET);}
+  		}
+	#endif
   }
   /* USER CODE END 3 */
 }
@@ -220,23 +289,18 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Configure the main internal regulator output voltage
-  */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV6;
-  RCC_OscInitStruct.PLL.PLLN = 85;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -248,10 +312,16 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
@@ -269,9 +339,6 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 0 */
 
-  ADC_MultiModeTypeDef multimode = {0};
-  ADC_ChannelConfTypeDef sConfig = {0};
-
   /* USER CODE BEGIN ADC1_Init 1 */
 
   /* USER CODE END ADC1_Init 1 */
@@ -279,43 +346,13 @@ static void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
-  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.GainCompensation = 0;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure the ADC multi-mode
-  */
-  multimode.Mode = ADC_MODE_INDEPENDENT;
-  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_2;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_6CYCLES_5;
-  sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.OffsetNumber = ADC_OFFSET_NONE;
-  sConfig.Offset = 0;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -326,89 +363,73 @@ static void MX_ADC1_Init(void)
 }
 
 /**
-  * @brief LPUART1 Initialization Function
+  * @brief SPI1 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_LPUART1_UART_Init(void)
+static void MX_SPI1_Init(void)
 {
 
-  /* USER CODE BEGIN LPUART1_Init 0 */
+  /* USER CODE BEGIN SPI1_Init 0 */
 
-  /* USER CODE END LPUART1_Init 0 */
+  /* USER CODE END SPI1_Init 0 */
 
-  /* USER CODE BEGIN LPUART1_Init 1 */
+  /* USER CODE BEGIN SPI1_Init 1 */
 
-  /* USER CODE END LPUART1_Init 1 */
-  hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 115200;
-  hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
-  hlpuart1.Init.StopBits = UART_STOPBITS_1;
-  hlpuart1.Init.Parity = UART_PARITY_NONE;
-  hlpuart1.Init.Mode = UART_MODE_TX_RX;
-  hlpuart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  hlpuart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  hlpuart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  hlpuart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&hlpuart1) != HAL_OK)
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&hlpuart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&hlpuart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&hlpuart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN LPUART1_Init 2 */
+  /* USER CODE BEGIN SPI1_Init 2 */
 
-  /* USER CODE END LPUART1_Init 2 */
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
 /**
-  * @brief SPI3 Initialization Function
+  * @brief USART2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_SPI3_Init(void)
+static void MX_USART2_UART_Init(void)
 {
 
-  /* USER CODE BEGIN SPI3_Init 0 */
+  /* USER CODE BEGIN USART2_Init 0 */
 
-  /* USER CODE END SPI3_Init 0 */
+  /* USER CODE END USART2_Init 0 */
 
-  /* USER CODE BEGIN SPI3_Init 1 */
+  /* USER CODE BEGIN USART2_Init 1 */
 
-  /* USER CODE END SPI3_Init 1 */
-  /* SPI3 parameter configuration*/
-  hspi3.Instance = SPI3;
-  hspi3.Init.Mode = SPI_MODE_MASTER;
-  hspi3.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi3.Init.NSS = SPI_NSS_SOFT;
-  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
-  hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi3.Init.CRCPolynomial = 7;
-  hspi3.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi3.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  if (HAL_SPI_Init(&hspi3) != HAL_OK)
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 9600;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI3_Init 2 */
+  /* USER CODE BEGIN USART2_Init 2 */
 
-  /* USER CODE END SPI3_Init 2 */
+  /* USER CODE END USART2_Init 2 */
 
 }
 
@@ -423,79 +444,41 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, DOUT_LED1_Pin|DOUT_LED2_Pin|DOUT_LED3_Pin|GPIO_W5500_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_W5500_CS_Pin|DOUT_LED5_Pin|DOUT_LED6_Pin|DOUT_LED7_Pin
+                          |DOUT_LED8_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, DOUT_LED4_Pin|DOUT_LED5_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, DOUT_LED1_Pin|DOUT_LED2_Pin|DOUT_LED3_Pin|DOUT_LED4_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, DOUT_LED6_Pin|DOUT_LED7_Pin|DOUT_LED8_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(RST_GPIO_Port, RST_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : DOUT_LED1_Pin DOUT_LED2_Pin DOUT_LED3_Pin GPIO_W5500_CS_Pin */
-  GPIO_InitStruct.Pin = DOUT_LED1_Pin|DOUT_LED2_Pin|DOUT_LED3_Pin|GPIO_W5500_CS_Pin;
+  /*Configure GPIO pin : GPIO_W5500_CS_Pin */
+  GPIO_InitStruct.Pin = GPIO_W5500_CS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIO_W5500_CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DOUT_LED4_Pin DOUT_LED5_Pin */
-  GPIO_InitStruct.Pin = DOUT_LED4_Pin|DOUT_LED5_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : DOUT_LED6_Pin DOUT_LED7_Pin DOUT_LED8_Pin */
-  GPIO_InitStruct.Pin = DOUT_LED6_Pin|DOUT_LED7_Pin|DOUT_LED8_Pin;
+  /*Configure GPIO pins : DOUT_LED1_Pin DOUT_LED2_Pin DOUT_LED3_Pin DOUT_LED4_Pin */
+  GPIO_InitStruct.Pin = DOUT_LED1_Pin|DOUT_LED2_Pin|DOUT_LED3_Pin|DOUT_LED4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : RST_Pin */
-  GPIO_InitStruct.Pin = RST_Pin;
+  /*Configure GPIO pins : DOUT_LED5_Pin DOUT_LED6_Pin DOUT_LED7_Pin DOUT_LED8_Pin */
+  GPIO_InitStruct.Pin = DOUT_LED5_Pin|DOUT_LED6_Pin|DOUT_LED7_Pin|DOUT_LED8_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(RST_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : INT_Pin */
-  GPIO_InitStruct.Pin = INT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(INT_GPIO_Port, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 }
 
 /* USER CODE BEGIN 4 */
-
-PUTCHAR_PROTOTYPE {
-	/* Place your implementation of fputc here */
-	/* e.g. write a character to the LPUART1 and Loop until the end of transmission */
-	HAL_UART_Transmit(&hlpuart1, (uint8_t*) &ch, 1, 0xFFFF);
-
-	return ch;
-}
-
 //Chamada da função de callback do systick (1ms)
 void HAL_SYSTICK_Callback()
 {
@@ -508,7 +491,7 @@ uint8_t W5500_rxtx(uint8_t data)
 {
 	uint8_t rxdata;
 
-	HAL_SPI_TransmitReceive(&hspi3, &data, &rxdata, 1, 50);
+	HAL_SPI_TransmitReceive(&hspi1, &data, &rxdata, 1, 50);
 
 	return (rxdata);
 }
@@ -955,7 +938,17 @@ void reverse(char s[])
 
  uint32_t Ain_Read_value(uint32_t channel)
  {
-   uint16_t result;
+   uint32_t result;
+   ADC_ChannelConfTypeDef sConfig;
+
+   sConfig.Channel = channel;
+   sConfig.SamplingTime = ADC_SAMPLETIME_41CYCLES_5;
+   sConfig.Rank = ADC_REGULAR_RANK_1;
+
+   HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+   HAL_ADCEx_Calibration_Start(&hadc1);
+
    HAL_ADC_Start(&hadc1);
    HAL_ADC_PollForConversion(&hadc1, 1000);
    result = HAL_ADC_GetValue(&hadc1);
@@ -995,11 +988,7 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
-	HAL_GPIO_WritePin(GPIOA, DOUT_LED1_Pin, SET);
-  __disable_irq();
-  while (1)
-  {
-  }
+
   /* USER CODE END Error_Handler_Debug */
 }
 
@@ -1015,7 +1004,7 @@ void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+     tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
